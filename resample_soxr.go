@@ -63,7 +63,7 @@ func newResampleWriter(w WriteCloser[PCM16Sample], sampleRate int, opts *resampl
 		dstRate: dstRate,
 		buffer:  0, // set larger buffer for better resampler quality (see below)
 	}
-	quality := int(C.SOXR_LQ)
+	quality := int(C.SOXR_HQ)
 	var err error
 	r.r, err = newSoxr(dstRate, srcRate, quality)
 	if err != nil {
