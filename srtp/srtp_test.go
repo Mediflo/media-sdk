@@ -15,6 +15,7 @@
 package srtp
 
 import (
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -138,11 +139,17 @@ func streamIsClosed(r rtp.ReadStream, timeout time.Duration) bool {
 // accepted from the underlying pion session but BEFORE session.AcceptStream
 // registers it. Under the unpatched code Close snapshots a streams slice that does
 // not yet contain that stream, so it is never closed and its ReadRTP blocks
-// forever. The fix (register under the mutex + tear the stream down if the session
-// is already closed) guarantees no accepted stream is left live-and-unclosed.
+// forever.
 //
-// This is the mandatory, DETERMINISTIC proof the fix works: it fails (blocks)
-// against the unpatched code every run, and passes with the fix.
+// This is the mandatory, DETERMINISTIC proof the fix works. It captures the raw
+// accepted pion stream (via the hook) and asserts BOTH:
+//   - AcceptStream returns io.EOF (the late stream is not handed out live), and
+//   - that captured stream WAS closed by AcceptStream (a second Close reports it
+//     already closed) -- so a subsequent read would error rather than block.
+//
+// Because it checks the captured stream directly, removing the `_ = r.Close()`
+// line from the fix makes this test FAIL (the stream would be left open), not
+// just the pre-fix version.
 func TestSessionAcceptCloseRace_Deterministic(t *testing.T) {
 	t.Cleanup(func() { afterAcceptHook = nil })
 	log := logger.GetLogger()
@@ -158,13 +165,16 @@ func TestSessionAcceptCloseRace_Deterministic(t *testing.T) {
 	w, err := aSess.OpenWriteStream()
 	require.NoError(t, err)
 
-	// The hook fires once, on the first accepted stream, and runs Close() right in
-	// the accept window before AcceptStream can register the stream. bSess.Close is
-	// invoked synchronously from the hook so the interleaving is guaranteed.
+	// The hook fires once, on the first accepted stream. It captures the raw pion
+	// stream and runs Close() right in the accept window, before AcceptStream can
+	// register the stream. bSess.Close is invoked synchronously from the hook so the
+	// interleaving is guaranteed.
 	var hookOnce sync.Once
+	var captured *srtp.ReadStreamSRTP
 	closeReturned := make(chan struct{})
-	afterAcceptHook = func() {
+	afterAcceptHook = func(r *srtp.ReadStreamSRTP) {
 		hookOnce.Do(func() {
+			captured = r
 			_ = bSess.Close()
 			close(closeReturned)
 		})
@@ -195,17 +205,26 @@ func TestSessionAcceptCloseRace_Deterministic(t *testing.T) {
 		t.Fatal("AcceptStream never returned after Close")
 	}
 
-	// Whatever AcceptStream returned, it must not leave a live-but-unclosed stream:
-	//   - fix path: it returns (nil, io.EOF) after closing the late stream; OR
-	//   - it returns a live stream that Close DID manage to close.
-	// In every case a ReadRTP on any returned live stream must NOT block forever.
-	if res.err == nil {
-		require.NotNil(t, res.r)
-		require.True(t, streamIsClosed(res.r, 2*time.Second),
-			"accepted stream's ReadRTP blocked after Close -- stream leaked (accept-vs-close race)")
-	} else {
-		require.Nil(t, res.r, "no live stream should be returned alongside an error")
-	}
+	// A stream accepted in the close window must NOT be handed out live: AcceptStream
+	// returns (nil, io.EOF) so the caller's accept loop stops (no reader is spawned).
+	require.Nil(t, res.r, "no live stream may be returned for a stream accepted during Close")
+	require.ErrorIs(t, res.err, io.EOF, "AcceptStream must return io.EOF for a stream accepted during Close")
+
+	// And the captured raw stream must actually have been CLOSED by the fix. A read on
+	// a closed pion stream's buffer returns an error promptly; a read on a leaked
+	// (still-open) stream's buffer blocks forever (nothing else feeds it -- the
+	// session's conn is closed). So streamIsClosed distinguishes the two directly on
+	// the SAME object the fix closes. Deleting `_ = r.Close()` from the fix leaves
+	// this stream open, so the read blocks and this assertion FAILS -- i.e. the test
+	// catches a removed close line, not just the original pre-fix code.
+	//
+	// (Note: pion's ReadStreamSRTP.Close never closes its isClosed channel, so a
+	// second Close is not a reliable "already closed" signal in this version; the
+	// read-based check is.)
+	require.NotNil(t, captured, "hook should have captured the accepted stream")
+	require.True(t, streamIsClosed(readStream{r: captured}, 2*time.Second),
+		"the stream accepted during Close was NOT closed by AcceptStream -- its buffer read blocked (leaked); "+
+			"removing `_ = r.Close()` from the fix triggers this")
 }
 
 // TestSessionAcceptCloseRace_Stress races AcceptStream against Close with real

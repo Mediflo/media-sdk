@@ -136,9 +136,11 @@ func (s *session) OpenWriteStream() (rtp.WriteStream, error) {
 
 // afterAcceptHook, if non-nil, is called in AcceptStream after a stream has been
 // accepted from the underlying pion session but before it is registered under the
-// mutex. It exists only for tests, to deterministically drive a Close() into the
-// accept-vs-close window; it is nil (and therefore free) in normal operation.
-var afterAcceptHook func()
+// mutex, receiving the just-accepted stream. It exists only for tests, to
+// deterministically drive a Close() into the accept-vs-close window and to capture
+// the raw stream for close verification; it is nil (and therefore free) in normal
+// operation.
+var afterAcceptHook func(*srtp.ReadStreamSRTP)
 
 func (s *session) AcceptStream() (rtp.ReadStream, uint32, error) {
 	r, ssrc, err := s.s.AcceptStream()
@@ -146,15 +148,25 @@ func (s *session) AcceptStream() (rtp.ReadStream, uint32, error) {
 		return nil, 0, err
 	}
 	if afterAcceptHook != nil {
-		afterAcceptHook()
+		afterAcceptHook(r)
 	}
-	// Register the accepted stream under the mutex, atomically with checking
-	// whether the session was already closed. pion/srtp does not close individual
-	// streams, so we track them to close on our own Close(). Previously the stream
-	// was accepted before this lock, so a Close() racing between AcceptStream
-	// returning and this append snapshotted a streams slice that did not yet
-	// contain r -- leaking it. Its pion buffer would never be closed and any
-	// ReadRTP on it would block forever (hanging callers that join their readers).
+	// Register the accepted stream under the mutex, atomically with checking whether
+	// the session was already closed. pion/srtp does not close individual streams, so
+	// we track them to close on our own Close(). Previously the stream was accepted
+	// before this lock, so a Close() racing between AcceptStream returning and this
+	// append snapshotted a streams slice that did not yet contain r -- leaking it
+	// permanently: its pion buffer was never closed and any ReadRTP on it blocked
+	// forever, hanging callers that join their readers.
+	//
+	// Guarantees now:
+	//  1. No stream is left PERMANENTLY unclosed: a stream is either registered here
+	//     (and closed by Close's drain) or, if the session is already closed, closed
+	//     right below.
+	//  2. No reader goroutine is ever started for a stream accepted during/after
+	//     Close: AcceptStream returns io.EOF for it, which stops the caller's accept
+	//     loop -- so callers that join their reader goroutines never hang.
+	// Close() may return a moment before such a late stream's teardown completes, but
+	// that stream is never handed out live and never read.
 	s.mu.Lock()
 	if s.closed {
 		// The session was closed while (or before) this stream was accepted. Close()
@@ -173,10 +185,12 @@ func (s *session) Close() error {
 	err := s.s.Close() // Stop packets first
 
 	s.mu.Lock()
-	// Mark closed under the same lock AcceptStream registers under, so any stream
-	// accepted from here on is torn down by AcceptStream rather than leaked, and any
-	// stream already registered is in the snapshot below. Together this guarantees
-	// no stream is left both live and unclosed once Close returns.
+	// Mark closed under the same lock AcceptStream registers under. Every stream is
+	// then handled by exactly one path: one already registered is in the snapshot
+	// below and closed here; one still mid-accept sees closed==true and is closed by
+	// AcceptStream (which returns io.EOF, stopping the caller's accept loop so no
+	// reader is spawned for it). Close may return just before that late teardown
+	// finishes, but no stream is ever left permanently unclosed or handed out live.
 	s.closed = true
 	streams := s.streams
 	s.streams = nil
