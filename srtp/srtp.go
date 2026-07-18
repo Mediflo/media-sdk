@@ -17,6 +17,7 @@ package srtp
 import (
 	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 
@@ -121,6 +122,7 @@ type session struct {
 	s   *srtp.SessionSRTP
 
 	mu      sync.Mutex
+	closed  bool
 	streams []*srtp.ReadStreamSRTP
 }
 
@@ -132,13 +134,36 @@ func (s *session) OpenWriteStream() (rtp.WriteStream, error) {
 	return writeStream{w: w}, nil
 }
 
+// afterAcceptHook, if non-nil, is called in AcceptStream after a stream has been
+// accepted from the underlying pion session but before it is registered under the
+// mutex. It exists only for tests, to deterministically drive a Close() into the
+// accept-vs-close window; it is nil (and therefore free) in normal operation.
+var afterAcceptHook func()
+
 func (s *session) AcceptStream() (rtp.ReadStream, uint32, error) {
 	r, ssrc, err := s.s.AcceptStream()
 	if err != nil {
 		return nil, 0, err
 	}
-	s.mu.Lock() // TODO: move before accepting stream
-	// pion/srtp does not close individual streams, keep track of them
+	if afterAcceptHook != nil {
+		afterAcceptHook()
+	}
+	// Register the accepted stream under the mutex, atomically with checking
+	// whether the session was already closed. pion/srtp does not close individual
+	// streams, so we track them to close on our own Close(). Previously the stream
+	// was accepted before this lock, so a Close() racing between AcceptStream
+	// returning and this append snapshotted a streams slice that did not yet
+	// contain r -- leaking it. Its pion buffer would never be closed and any
+	// ReadRTP on it would block forever (hanging callers that join their readers).
+	s.mu.Lock()
+	if s.closed {
+		// The session was closed while (or before) this stream was accepted. Close()
+		// has already drained the streams it knew about and will not see this one, so
+		// tear it down here instead of returning a live-but-never-closed stream.
+		s.mu.Unlock()
+		_ = r.Close()
+		return nil, 0, io.EOF
+	}
 	s.streams = append(s.streams, r)
 	s.mu.Unlock()
 	return readStream{r: r}, ssrc, nil
@@ -148,6 +173,11 @@ func (s *session) Close() error {
 	err := s.s.Close() // Stop packets first
 
 	s.mu.Lock()
+	// Mark closed under the same lock AcceptStream registers under, so any stream
+	// accepted from here on is torn down by AcceptStream rather than leaked, and any
+	// stream already registered is in the snapshot below. Together this guarantees
+	// no stream is left both live and unclosed once Close returns.
+	s.closed = true
 	streams := s.streams
 	s.streams = nil
 	s.mu.Unlock()
