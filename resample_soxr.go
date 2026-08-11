@@ -58,12 +58,13 @@ func newResampleWriter(w WriteCloser[PCM16Sample], sampleRate int, opts *resampl
 	srcRate := sampleRate
 	dstRate := w.SampleRate()
 	r := &resampleWriter{
-		w:       w,
-		srcRate: srcRate,
-		dstRate: dstRate,
-		buffer:  0, // set larger buffer for better resampler quality (see below)
+		w:          w,
+		srcRate:    srcRate,
+		dstRate:    dstRate,
+		buffer:     0, // set larger buffer for better resampler quality (see below)
+		earlyFlush: opts.EarlyFlush,
 	}
-	quality := int(C.SOXR_LQ)
+	quality := int(C.SOXR_HQ)
 	var err error
 	r.r, err = newSoxr(dstRate, srcRate, quality)
 	if err != nil {
@@ -83,7 +84,11 @@ type resampleWriter struct {
 	// The resampler could actually consume multiple full frames and emit just one.
 	// This variable controls how many full frames we intentionally keep. Useful for higher resampler quality.
 	buffer int
-	buf    PCM16Sample
+	// earlyFlush drops the "hold back a whole destination frame" rule (see
+	// WithEarlyFlush): output goes downstream as soon as the resampler produces
+	// it, trading neat framing for the one frame of latency that rule costs.
+	earlyFlush bool
+	buf        PCM16Sample
 }
 
 func (w *resampleWriter) String() string {
@@ -94,21 +99,54 @@ func (w *resampleWriter) SampleRate() int {
 	return w.srcRate
 }
 
+// maxCloseDrainRounds bounds the flush loop in Close. Each round offers the
+// resampler at least 1024 samples of space (Resample's dstN floor), so a
+// well-behaved resampler empties in a handful of rounds; a real telephony tail is
+// far below the bound. It exists only so a resampler that never reports empty
+// cannot spin forever — and hitting it is reported as an error rather than passed
+// off as a clean close, since it means the tail was truncated.
+//
+// A var, not a const, only so a test can shrink it far enough to reach the
+// exhaustion path with a real resampler. Never written in production.
+var maxCloseDrainRounds = 64
+
 func (w *resampleWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// Flush soxr buffer to our buffer.
+	// Flush soxr's remaining output into our buffer, repeatedly.
+	//
+	// One Resample(nil) call only drains as much as the destination buffer's SPARE
+	// CAPACITY allows (dstN falls back to cap(out)-len(out) when there is no
+	// input), so a single call leaves a tail whose size depends on how full w.buf
+	// happened to be at close. That made the surviving tail depend on unrelated
+	// buffering decisions — early flushing, which keeps w.buf near-empty, dropped
+	// several hundred more samples than the default path. Looping until the
+	// resampler reports nothing left makes the tail deterministic and complete
+	// however the writer was configured.
 	var err error
-	w.buf, _, err = w.r.Resample(w.buf, nil)
-	if err != nil {
-		return err
+	drained := false
+	for i := 0; i < maxCloseDrainRounds; i++ {
+		var n int
+		w.buf, n, err = w.r.Resample(w.buf, nil)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			drained = true
+			break
+		}
+	}
+	if !drained {
+		// Still producing after the bound: whatever is left is lost once the
+		// resampler is destroyed below, so say so instead of returning nil.
+		err = ErrIncompleteDrain
 	}
 	// Close soxr resampler.
 	_ = w.r.Close()
 	// Flush our own PCM frame buffer to the underlying writer.
 	_ = w.flush(0)
-	err2 := w.w.Close()
-	if err2 != nil {
+	// A failure closing the downstream writer is the more actionable of the two.
+	if err2 := w.w.Close(); err2 != nil {
 		err = err2
 	}
 	return err
@@ -154,7 +192,15 @@ func (w *resampleWriter) WriteSample(data PCM16Sample) error {
 	// discontinuity, and thus - distortions on the frame boundaries.
 	dstFrame := resampleSize(w.dstRate, w.srcRate, len(data))
 	w.dstFrame = max(w.dstFrame, dstFrame)
-	return w.flush(w.dstFrame * (1 + w.buffer))
+	minSize := w.dstFrame * (1 + w.buffer)
+	if w.earlyFlush {
+		// Caller accepted the discontinuity to get that frame of latency back
+		// (WithEarlyFlush) — emit whatever exists. Still framed in dstFrame chunks
+		// by flush(), with a short remainder, so downstream sees the same samples
+		// in the same order, just sooner and in ragged sizes.
+		minSize = 1
+	}
+	return w.flush(minSize)
 }
 
 type soxrResampler struct {

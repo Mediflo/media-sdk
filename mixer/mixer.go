@@ -65,6 +65,11 @@ type Input struct {
 	mu         sync.Mutex
 	buf        *ring.Buffer[int16]
 	buffering  bool
+	// bufMinFrames is this input's minimum buffering depth in frames, seeded from
+	// the mixer's inputBufferMin at NewInput. Per-input so a caller can trade
+	// latency for smoothing on one source without touching the others — see
+	// SetBufferMinFrames.
+	bufMinFrames int
 }
 
 type Mixer struct {
@@ -166,10 +171,11 @@ func newMixer(out msdk.Writer[msdk.PCM16Sample], mixSize int, options ...MixerOp
 func (m *Mixer) mixInputs() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Keep at least half of the samples buffered.
-	bufMin := m.inputBufferMin * len(m.mixBuf)
+	// Each input keeps at least its own bufMinFrames frames buffered (seeded from
+	// inputBufferMin, which by default keeps at least half of the samples buffered).
+	frame := len(m.mixBuf)
 	for _, inp := range m.inputs {
-		n, _ := inp.readSample(bufMin, m.mixTmp[:len(m.mixBuf)])
+		n, _ := inp.readSample(frame, m.mixTmp[:frame])
 		if n == 0 {
 			continue
 		}
@@ -319,10 +325,11 @@ func (m *Mixer) NewInput() *Input {
 	m.stats.TracksTotal.Add(1)
 
 	inp := &Input{
-		m:          m,
-		sampleRate: m.sampleRate,
-		buf:        ring.NewBuffer[int16](len(m.mixBuf) * m.inputBufferFrames),
-		buffering:  true, // buffer some data initially
+		m:            m,
+		sampleRate:   m.sampleRate,
+		buf:          ring.NewBuffer[int16](len(m.mixBuf) * m.inputBufferFrames),
+		buffering:    true, // buffer some data initially
+		bufMinFrames: m.inputBufferMin,
 	}
 	m.inputs = append(m.inputs, inp)
 	return inp
@@ -342,6 +349,22 @@ func (m *Mixer) RemoveInput(inp *Input) {
 	m.stats.Tracks.Add(-1)
 }
 
+// InputBufferMinFrames reports the minimum input buffering depth, in frames, that
+// new inputs inherit (see Input.SetBufferMinFrames to change one input's depth).
+func (m *Mixer) InputBufferMinFrames() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.inputBufferMin
+}
+
+// maxInputBufferFrames reports the input ring capacity in frames — the ceiling for
+// any input's buffering depth, since a deeper minimum could never be reached.
+func (m *Mixer) maxInputBufferFrames() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.inputBufferFrames
+}
+
 func (m *Mixer) String() string {
 	return fmt.Sprintf("Mixer(%d) -> %s", len(m.inputs), m.out.String())
 }
@@ -350,11 +373,14 @@ func (m *Mixer) SampleRate() int {
 	return m.sampleRate
 }
 
-func (i *Input) readSample(bufMin int, out msdk.PCM16Sample) (int, error) {
+// readSample reads up to one frame. frameSize is the mixer's frame length in
+// samples; the input's own depth (bufMinFrames) scales it into the number of
+// buffered samples required before playback (re)starts.
+func (i *Input) readSample(frameSize int, out msdk.PCM16Sample) (int, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.buffering {
-		if i.buf.Len() < bufMin {
+		if i.buf.Len() < i.bufMinFrames*frameSize {
 			return 0, nil // keep buffering
 		}
 		// buffered enough data - start playing as usual
@@ -366,6 +392,59 @@ func (i *Input) readSample(bufMin int, out msdk.PCM16Sample) (int, error) {
 		i.m.stats.Restarts.Add(1)
 	}
 	return n, err
+}
+
+// SetBufferMinFrames changes how many frames THIS input must have buffered before
+// the mixer starts (or resumes) reading it. It is the knob that decides the
+// input's steady-state latency: an input settles at roughly this much buffered
+// audio, so on the 20 ms frames a SIP leg uses the inherited default of 3 frames
+// is ~60 ms of added mouth-to-ear delay, and 1 frame is ~20 ms. In exchange the
+// input starves (and re-buffers, counting Stats.Restarts) on jitter the removed
+// slack would have absorbed — which is why this is per-input: a caller can shorten
+// a live conversation's path while leaving, say, a prompt/music source smooth.
+//
+// Unlike WithInputBufferFrames this does NOT resize anything: inputBufferFrames
+// keeps sizing the ring (burst tolerance / overflow point) and keeps capping the
+// catch-up mixes in mixUpdate. Lowering only the minimum therefore buys latency
+// without making the input drop frames on a burst or wedging the catch-up path —
+// WithInputBufferFrames(1) would do both, since it shrinks every ring to a single
+// frame and caps catch-up at one mix.
+//
+// Safe to call at any time, including while the mixer is running and this input is
+// already receiving audio: bufMinFrames is a pure threshold, read only under i.mu
+// in readSample, and never used to size or index anything. It cannot drop,
+// duplicate or reorder a sample; the only observable effect is that an input which
+// happens to be (re)buffering right now starts playing after fewer frames.
+//
+// frames <= 0 restores the mixer's inherited default. Larger values are clamped to
+// the ring's capacity in frames, because an input can never buffer more than its
+// ring holds and an unclamped value would leave it buffering forever.
+func (i *Input) SetBufferMinFrames(frames int) {
+	if i == nil {
+		return
+	}
+	// Both read under m.mu and released before i.mu is taken, so this never nests
+	// the two locks (mixInputs already holds m.mu while readSample takes i.mu).
+	def, maxFrames := i.m.InputBufferMinFrames(), i.m.maxInputBufferFrames()
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if frames <= 0 {
+		frames = def
+	}
+	if frames > maxFrames {
+		frames = maxFrames
+	}
+	i.bufMinFrames = frames
+}
+
+// BufferMinFrames reports this input's minimum buffering depth, in frames.
+func (i *Input) BufferMinFrames() int {
+	if i == nil {
+		return 0
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.bufMinFrames
 }
 
 func (i *Input) String() string {

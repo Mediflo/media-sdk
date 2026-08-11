@@ -221,3 +221,139 @@ func TestMixer(t *testing.T) {
 		m.CheckSampleN(steps)
 	})
 }
+
+func TestInputBufferMinFrames(t *testing.T) {
+	t.Run("inherits the mixer default", func(t *testing.T) {
+		m := newTestMixer(t)
+		require.Equal(t, DefaultInputBufferMin, m.InputBufferMinFrames())
+		require.Equal(t, 3, m.InputBufferMinFrames()) // 3 frames == 60ms at 20ms/frame
+
+		inp := m.NewInput()
+		defer inp.Close()
+		require.Equal(t, DefaultInputBufferMin, inp.BufferMinFrames())
+
+		// One frame is NOT enough to start playing at the inherited depth.
+		inp.WriteSample([]int16{10, 11, 12, 13, 14})
+		m.Expect(msdk.PCM16Sample{0, 0, 0, 0, 0})
+	})
+
+	t.Run("depth 1 starts playing on the first frame", func(t *testing.T) {
+		m := newTestMixer(t)
+		inp := m.NewInput()
+		defer inp.Close()
+		inp.SetBufferMinFrames(1)
+		require.Equal(t, 1, inp.BufferMinFrames())
+
+		inp.WriteSample([]int16{10, 11, 12, 13, 14})
+		m.Expect(msdk.PCM16Sample{10, 11, 12, 13, 14})
+
+		// And it keeps flowing frame-by-frame with only one frame in hand.
+		for i := 0; i < 4; i++ {
+			WriteSampleN(inp, i)
+			m.ExpectSampleN(i, "i=%d", i)
+		}
+	})
+
+	// The point of making this per-input: one source may run short while another
+	// keeps the full smoothing, in the SAME mixer. sip-bridge relies on it to give
+	// a live conversation the shorter path while platform prompts/hold music keep
+	// the default depth.
+	t.Run("depths are independent within one mixer", func(t *testing.T) {
+		m := newTestMixer(t)
+		shallow := m.NewInput()
+		defer shallow.Close()
+		shallow.SetBufferMinFrames(1)
+		deep := m.NewInput()
+		defer deep.Close()
+		require.Equal(t, DefaultInputBufferMin, deep.BufferMinFrames())
+
+		shallow.WriteSample([]int16{10, 11, 12, 13, 14})
+		deep.WriteSample([]int16{1, 1, 1, 1, 1})
+		// One frame is enough for the shallow input and not for the deep one.
+		m.Expect(msdk.PCM16Sample{10, 11, 12, 13, 14})
+		require.False(t, shallow.buffering)
+		require.True(t, deep.buffering)
+
+		// Nothing new arrives: the shallow input starves (that is the price of
+		// depth 1), the deep one is still filling up.
+		m.Expect(msdk.PCM16Sample{0, 0, 0, 0, 0})
+		require.True(t, shallow.buffering)
+		require.True(t, deep.buffering)
+
+		// Bring the deep input up to its own 3-frame depth and hand the shallow one
+		// a single frame; now both contribute to the same mix.
+		deep.WriteSample([]int16{1, 1, 1, 1, 1})
+		deep.WriteSample([]int16{1, 1, 1, 1, 1})
+		shallow.WriteSample([]int16{10, 10, 10, 10, 10})
+		m.Expect(msdk.PCM16Sample{11, 11, 11, 11, 11})
+		require.False(t, shallow.buffering)
+		require.False(t, deep.buffering)
+	})
+
+	t.Run("depth 1 does not shrink the input ring", func(t *testing.T) {
+		// The overflow point is set by inputBufferFrames, which this setter must not
+		// touch: WithInputBufferFrames(1) would leave room for a single frame and drop
+		// on every burst. Same expectation as TestMixer/"drops frames on overflow".
+		m := newTestMixer(t)
+		input := m.NewInput()
+		defer input.Close()
+		input.SetBufferMinFrames(1)
+
+		for i := 0; i < DefaultInputBufferFrames+3; i++ {
+			input.WriteSample([]int16{0, 1, 2, 3, 4})
+		}
+		m.mixOnce()
+		require.Equal(t, (DefaultInputBufferFrames-1)*5, input.buf.Len())
+		require.EqualValues(t, DefaultInputBufferFrames, m.inputBufferFrames)
+	})
+
+	t.Run("reconfigurable under a live buffering input", func(t *testing.T) {
+		// Mirrors production: the input is created by a track-subscribed callback and
+		// its depth is set right after, while the mixer is already ticking.
+		m := newTestMixer(t)
+		inp := m.NewInput()
+		defer inp.Close()
+
+		inp.WriteSample([]int16{10, 11, 12, 13, 14})
+		m.Expect(msdk.PCM16Sample{0, 0, 0, 0, 0}) // buffering at the inherited depth 3
+		require.True(t, inp.buffering)
+
+		inp.SetBufferMinFrames(1)
+		// The already-buffered frame is still there, and plays now — nothing lost.
+		m.Expect(msdk.PCM16Sample{10, 11, 12, 13, 14})
+		require.False(t, inp.buffering)
+	})
+
+	t.Run("clamped and reset", func(t *testing.T) {
+		m := newTestMixer(t)
+		inp := m.NewInput()
+		defer inp.Close()
+		inp.SetBufferMinFrames(DefaultInputBufferFrames + 10)
+		require.Equal(t, DefaultInputBufferFrames, inp.BufferMinFrames())
+		inp.SetBufferMinFrames(0)
+		require.Equal(t, DefaultInputBufferMin, inp.BufferMinFrames())
+		inp.SetBufferMinFrames(1)
+		inp.SetBufferMinFrames(-1)
+		require.Equal(t, DefaultInputBufferMin, inp.BufferMinFrames())
+	})
+
+	t.Run("clamp and reset follow a custom inputBufferFrames", func(t *testing.T) {
+		m := newMixer(newTestWriter(new(msdk.PCM16Sample), 8000), 5, WithInputBufferFrames(9))
+		require.Equal(t, 5, m.InputBufferMinFrames())
+		inp := m.NewInput()
+		defer inp.Close()
+		require.Equal(t, 5, inp.BufferMinFrames())
+		inp.SetBufferMinFrames(1)
+		require.Equal(t, 1, inp.BufferMinFrames())
+		inp.SetBufferMinFrames(100)
+		require.Equal(t, 9, inp.BufferMinFrames())
+		inp.SetBufferMinFrames(0)
+		require.Equal(t, 5, inp.BufferMinFrames())
+	})
+
+	t.Run("nil input is a no-op", func(t *testing.T) {
+		var inp *Input
+		inp.SetBufferMinFrames(1)
+		require.Equal(t, 0, inp.BufferMinFrames())
+	})
+}
