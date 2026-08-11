@@ -227,3 +227,22 @@ func TestResampleEarlyFlushPredictableUnaffected(t *testing.T) {
 	require.Equal(t, slow, fast)
 	require.NotZero(t, slowPer[0], "the predictable resampler already emits on the first frame")
 }
+
+// codex P2 round 2 (2026-08-11): the close-drain loop is bounded, and exhausting
+// that bound means the tail was truncated. Close must say so rather than return
+// nil. A normal close is well inside the bound, so it must report success.
+func TestResampleCloseReportsIncompleteDrain(t *testing.T) {
+	const srcRate, dstRate = 8000, 48000
+	var got media.PCM16Sample
+	dst := media.NewPCM16BufferWriter(&got, dstRate)
+	r := media.ResampleWriter(dst, srcRate)
+	for _, f := range telephonyFrames(srcRate, 60) {
+		require.NoError(t, r.WriteSample(f))
+	}
+	require.NoError(t, r.Close(), "a normal close drains well inside the round limit")
+
+	// The sentinel is exported so a caller can tell a truncated tail from a
+	// downstream write failure.
+	require.NotNil(t, media.ErrIncompleteDrain)
+	require.NotEqual(t, "", media.ErrIncompleteDrain.Error())
+}

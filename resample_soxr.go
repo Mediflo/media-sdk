@@ -99,11 +99,18 @@ func (w *resampleWriter) SampleRate() int {
 	return w.srcRate
 }
 
-// maxCloseDrainRounds bounds the flush loop in Close. Each round drains at least
-// 1024 samples (see Resample's dstN floor), so this is ~64k samples — far beyond
-// any resampler's internal backlog, and only a guard against a resampler that
-// never reports empty.
+// maxCloseDrainRounds bounds the flush loop in Close. Each round offers the
+// resampler at least 1024 samples of space (Resample's dstN floor), so a
+// well-behaved resampler empties in a handful of rounds; a real telephony tail is
+// far below the bound. It exists only so a resampler that never reports empty
+// cannot spin forever — and hitting it is reported as an error rather than passed
+// off as a clean close, since it means the tail was truncated.
 const maxCloseDrainRounds = 64
+
+// ErrIncompleteDrain is returned by Close when the resampler still had output to
+// give after maxCloseDrainRounds rounds. The writer is closed either way; the
+// error says the very end of the stream was truncated.
+var ErrIncompleteDrain = errors.New("resampler did not drain within the round limit")
 
 func (w *resampleWriter) Close() error {
 	w.mu.Lock()
@@ -119,6 +126,7 @@ func (w *resampleWriter) Close() error {
 	// resampler reports nothing left makes the tail deterministic and complete
 	// however the writer was configured.
 	var err error
+	drained := false
 	for i := 0; i < maxCloseDrainRounds; i++ {
 		var n int
 		w.buf, n, err = w.r.Resample(w.buf, nil)
@@ -126,15 +134,21 @@ func (w *resampleWriter) Close() error {
 			return err
 		}
 		if n == 0 {
+			drained = true
 			break
 		}
+	}
+	if !drained {
+		// Still producing after the bound: whatever is left is lost once the
+		// resampler is destroyed below, so say so instead of returning nil.
+		err = ErrIncompleteDrain
 	}
 	// Close soxr resampler.
 	_ = w.r.Close()
 	// Flush our own PCM frame buffer to the underlying writer.
 	_ = w.flush(0)
-	err2 := w.w.Close()
-	if err2 != nil {
+	// A failure closing the downstream writer is the more actionable of the two.
+	if err2 := w.w.Close(); err2 != nil {
 		err = err2
 	}
 	return err
