@@ -17,6 +17,11 @@ concurrency:
 
 jobs:
   notify-devs:
+    # Upstream-only. This needs livekit's Slack secrets, which the Mediflo fork does
+    # not have (and should not wire up), so on the fork the job would only ever fail
+    # and add a red X to every PR. Guarded rather than deleted, to keep the file
+    # mergeable when the fork syncs with upstream.
+    if: github.repository == 'livekit/media-sdk'
     runs-on: ubuntu-latest
     steps:
       - uses: livekit/slack-notifier-action@main
