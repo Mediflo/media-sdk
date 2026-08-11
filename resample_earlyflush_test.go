@@ -62,6 +62,78 @@ func runResample(t *testing.T, srcRate, dstRate int, frames []media.PCM16Sample,
 	return perInput, got
 }
 
+// maxDitherDelta bounds how far two independent soxr instances may differ on the
+// same input.
+//
+// soxr applies TPDF dither to INT16 output, and it is ON by default: newSoxr builds
+// soxr_io_spec(SOXR_INT16_I, SOXR_INT16_I) with flags 0, and SOXR_NO_DITHER (the
+// only switch) is never set. Its RNG is unseeded and libsoxr's public API exposes no
+// way to seed it — which is what the standing "TODO: set seed somehow, otherwise
+// results are random" in resample.go refers to, and why resample_test.go cannot
+// checksum resampler output either. So two separately-constructed resamplers fed
+// identical input disagree in the low bit, by design.
+//
+// Measured on linux/amd64 (8k->48k, 60 frames of an amplitude-8000 tone): 44.8% of
+// samples differ, max |delta| 2 — about -72 dB, i.e. inaudible dither noise, not
+// drift. darwin/arm64 happened to agree exactly, which is why byte equality survived
+// review until CI ran on Linux.
+//
+// Deliberately kept at the measured maximum rather than rounded up: any real change
+// to the resampling itself moves samples by far more than 2 LSB and must still fail.
+const maxDitherDelta = 2
+
+// requireAlignedWithinDither asserts that b is a's live stream: sample-for-sample
+// aligned, differing only at dither scale.
+//
+// This is the property WithEarlyFlush must hold — flushing mid-stream changes WHEN
+// samples are handed over, never WHICH — expressed without depending on soxr's
+// unseeded dither. Alignment is still checked exactly: a genuine off-by-one would
+// make some non-zero shift agree better than zero shift, and that fails here.
+func requireAlignedWithinDither(t *testing.T, a, b media.PCM16Sample) {
+	t.Helper()
+	require.Equal(t, len(a), len(b), "live streams must cover the same span")
+
+	// Count samples agreeing within the dither envelope at a given shift. Every
+	// shift is scored over the SAME interior window, so zero shift gets no free
+	// advantage from the samples a shifted comparison would run off the end of.
+	const maxShift = 2
+	require.Greater(t, len(a), 2*maxShift, "too short to test alignment")
+	agree := func(shift int) int {
+		n := 0
+		for i := maxShift; i < len(a)-maxShift; i++ {
+			d := int(a[i]) - int(b[i+shift])
+			if d < 0 {
+				d = -d
+			}
+			if d <= maxDitherDelta {
+				n++
+			}
+		}
+		return n
+	}
+
+	worst, worstAt := 0, -1
+	for i := range a {
+		d := int(a[i]) - int(b[i])
+		if d < 0 {
+			d = -d
+		}
+		if d > worst {
+			worst, worstAt = d, i
+		}
+	}
+	require.LessOrEqualf(t, worst, maxDitherDelta,
+		"live streams diverge by %d at sample %d, beyond dither scale: early flush changed the audio, not just its timing",
+		worst, worstAt)
+
+	aligned := agree(0)
+	for _, shift := range []int{-2, -1, 1, 2} {
+		require.Greaterf(t, aligned, agree(shift),
+			"live stream agrees better at shift %+d (%d samples) than at 0 (%d): early flush moved samples in time",
+			shift, agree(shift), aligned)
+	}
+}
+
 // backlog reports how much audio the writer is holding once the stream is
 // running: everything fed in, minus everything handed downstream. That number,
 // divided by the destination rate, IS the latency the writer adds.
@@ -112,6 +184,9 @@ func TestResampleEarlyFlush(t *testing.T) {
 	// The reason this is safe on a re-framing consumer: through the whole live
 	// stream, early flush changes WHEN samples are handed over, not WHICH.
 	//
+	// Asserted as alignment + a dither-scale bound rather than byte equality, because
+	// byte equality is not a property soxr provides. See requireAlignedWithinDither.
+	//
 	// Compared up to the point where Close's drain begins. The flush tail — the
 	// backlog the resampler was holding when the stream ended, i.e. audio after
 	// the far end already stopped sending — is chunked differently by the two
@@ -119,7 +194,7 @@ func TestResampleEarlyFlush(t *testing.T) {
 	// destination buffer's spare capacity and early flushing leaves that buffer
 	// empty. Same amount of audio either way (asserted below); the last ~150 ms of
 	// a torn-down call is rendered from a differently-split flush.
-	t.Run("identical through the live stream", func(t *testing.T) {
+	t.Run("sample-aligned through the live stream", func(t *testing.T) {
 		slowPer, slow := runResample(t, srcRate, dstRate, src)
 		_, fast := runResample(t, srcRate, dstRate, src, media.WithEarlyFlush(true))
 		require.Equal(t, len(slow), len(fast), "early flush must not change how much audio survives")
@@ -127,7 +202,7 @@ func TestResampleEarlyFlush(t *testing.T) {
 		// Everything handed over before Close, i.e. the whole live stream.
 		live := frames*dstFrame - backlog(slowPer, dstFrame)
 		require.Greater(t, live, frames*dstFrame/2, "not enough live stream to be a meaningful comparison")
-		require.Equal(t, slow[:live], fast[:live], "the live stream must be identical")
+		requireAlignedWithinDither(t, slow[:live], fast[:live])
 	})
 
 	// codex P2 (2026-08-11): Close used to drain the resampler with a single call,
