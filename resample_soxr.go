@@ -105,12 +105,10 @@ func (w *resampleWriter) SampleRate() int {
 // far below the bound. It exists only so a resampler that never reports empty
 // cannot spin forever — and hitting it is reported as an error rather than passed
 // off as a clean close, since it means the tail was truncated.
-const maxCloseDrainRounds = 64
-
-// ErrIncompleteDrain is returned by Close when the resampler still had output to
-// give after maxCloseDrainRounds rounds. The writer is closed either way; the
-// error says the very end of the stream was truncated.
-var ErrIncompleteDrain = errors.New("resampler did not drain within the round limit")
+//
+// A var, not a const, only so a test can shrink it far enough to reach the
+// exhaustion path with a real resampler. Never written in production.
+var maxCloseDrainRounds = 64
 
 func (w *resampleWriter) Close() error {
 	w.mu.Lock()

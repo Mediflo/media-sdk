@@ -15,6 +15,7 @@
 package media
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -26,6 +27,15 @@ var (
 )
 
 var DefaultResampleOptions []ResampleOption
+
+// ErrIncompleteDrain is returned by a resample writer's Close when the resampler
+// still had output to give after the bounded drain loop gave up. The writer is
+// closed either way; the error says the very end of the stream was truncated.
+//
+// Declared here rather than next to the writer so it exists in every build
+// configuration — the soxr writer is cgo-only, and callers (and tests) must be
+// able to reference the sentinel with CGO_ENABLED=0 too.
+var ErrIncompleteDrain = errors.New("resampler did not drain within the round limit")
 
 // Resample the source sample into the destination sample rate.
 // It appends resulting samples to dst and returns the result.
