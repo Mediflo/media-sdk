@@ -109,16 +109,44 @@ func TestResampleEarlyFlush(t *testing.T) {
 			savedMs, slowBacklog, fastBacklog)
 	})
 
-	// The reason this is safe on a re-framing consumer: early flush changes WHEN
-	// samples are handed over, not WHICH. Compared over the common prefix — the
-	// tail differs only because Close() drains soxr with whatever spare capacity
-	// the buffer happens to have, which the two configurations reach differently.
-	t.Run("same samples, in the same order", func(t *testing.T) {
-		_, slow := runResample(t, srcRate, dstRate, src)
+	// The reason this is safe on a re-framing consumer: through the whole live
+	// stream, early flush changes WHEN samples are handed over, not WHICH.
+	//
+	// Compared up to the point where Close's drain begins. The flush tail — the
+	// backlog the resampler was holding when the stream ended, i.e. audio after
+	// the far end already stopped sending — is chunked differently by the two
+	// configurations, because Resample() sizes each drain round from the
+	// destination buffer's spare capacity and early flushing leaves that buffer
+	// empty. Same amount of audio either way (asserted below); the last ~150 ms of
+	// a torn-down call is rendered from a differently-split flush.
+	t.Run("identical through the live stream", func(t *testing.T) {
+		slowPer, slow := runResample(t, srcRate, dstRate, src)
 		_, fast := runResample(t, srcRate, dstRate, src, media.WithEarlyFlush(true))
-		n := min(len(slow), len(fast))
-		require.Greater(t, n, frames*dstFrame/2, "not enough common output to compare")
-		require.Equal(t, slow[:n], fast[:n], "the resampled stream must be identical")
+		require.Equal(t, len(slow), len(fast), "early flush must not change how much audio survives")
+
+		// Everything handed over before Close, i.e. the whole live stream.
+		live := frames*dstFrame - backlog(slowPer, dstFrame)
+		require.Greater(t, live, frames*dstFrame/2, "not enough live stream to be a meaningful comparison")
+		require.Equal(t, slow[:live], fast[:live], "the live stream must be identical")
+	})
+
+	// codex P2 (2026-08-11): Close used to drain the resampler with a single call,
+	// bounded by the destination buffer's spare capacity — so how much of the tail
+	// survived depended on how full that buffer happened to be, and early flushing
+	// (which keeps it empty) discarded ~584 samples more than the default. Close
+	// now loops until the resampler reports empty, so BOTH paths deliver every
+	// sample that was fed in.
+	t.Run("close drains the resampler completely", func(t *testing.T) {
+		fed := frames * dstFrame
+		for _, early := range []bool{false, true} {
+			var opts []media.ResampleOption
+			if early {
+				opts = append(opts, media.WithEarlyFlush(true))
+			}
+			_, all := runResample(t, srcRate, dstRate, src, opts...)
+			require.Equal(t, fed, len(all),
+				"early=%v: every sample fed in must come out by Close", early)
+		}
 	})
 
 	// Negative control for the SIP-out direction, which must NOT use this: with

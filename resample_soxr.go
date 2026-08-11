@@ -99,14 +99,35 @@ func (w *resampleWriter) SampleRate() int {
 	return w.srcRate
 }
 
+// maxCloseDrainRounds bounds the flush loop in Close. Each round drains at least
+// 1024 samples (see Resample's dstN floor), so this is ~64k samples — far beyond
+// any resampler's internal backlog, and only a guard against a resampler that
+// never reports empty.
+const maxCloseDrainRounds = 64
+
 func (w *resampleWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// Flush soxr buffer to our buffer.
+	// Flush soxr's remaining output into our buffer, repeatedly.
+	//
+	// One Resample(nil) call only drains as much as the destination buffer's SPARE
+	// CAPACITY allows (dstN falls back to cap(out)-len(out) when there is no
+	// input), so a single call leaves a tail whose size depends on how full w.buf
+	// happened to be at close. That made the surviving tail depend on unrelated
+	// buffering decisions — early flushing, which keeps w.buf near-empty, dropped
+	// several hundred more samples than the default path. Looping until the
+	// resampler reports nothing left makes the tail deterministic and complete
+	// however the writer was configured.
 	var err error
-	w.buf, _, err = w.r.Resample(w.buf, nil)
-	if err != nil {
-		return err
+	for i := 0; i < maxCloseDrainRounds; i++ {
+		var n int
+		w.buf, n, err = w.r.Resample(w.buf, nil)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			break
+		}
 	}
 	// Close soxr resampler.
 	_ = w.r.Close()
