@@ -58,10 +58,11 @@ func newResampleWriter(w WriteCloser[PCM16Sample], sampleRate int, opts *resampl
 	srcRate := sampleRate
 	dstRate := w.SampleRate()
 	r := &resampleWriter{
-		w:       w,
-		srcRate: srcRate,
-		dstRate: dstRate,
-		buffer:  0, // set larger buffer for better resampler quality (see below)
+		w:          w,
+		srcRate:    srcRate,
+		dstRate:    dstRate,
+		buffer:     0, // set larger buffer for better resampler quality (see below)
+		earlyFlush: opts.EarlyFlush,
 	}
 	quality := int(C.SOXR_HQ)
 	var err error
@@ -83,7 +84,11 @@ type resampleWriter struct {
 	// The resampler could actually consume multiple full frames and emit just one.
 	// This variable controls how many full frames we intentionally keep. Useful for higher resampler quality.
 	buffer int
-	buf    PCM16Sample
+	// earlyFlush drops the "hold back a whole destination frame" rule (see
+	// WithEarlyFlush): output goes downstream as soon as the resampler produces
+	// it, trading neat framing for the one frame of latency that rule costs.
+	earlyFlush bool
+	buf        PCM16Sample
 }
 
 func (w *resampleWriter) String() string {
@@ -154,7 +159,15 @@ func (w *resampleWriter) WriteSample(data PCM16Sample) error {
 	// discontinuity, and thus - distortions on the frame boundaries.
 	dstFrame := resampleSize(w.dstRate, w.srcRate, len(data))
 	w.dstFrame = max(w.dstFrame, dstFrame)
-	return w.flush(w.dstFrame * (1 + w.buffer))
+	minSize := w.dstFrame * (1 + w.buffer)
+	if w.earlyFlush {
+		// Caller accepted the discontinuity to get that frame of latency back
+		// (WithEarlyFlush) — emit whatever exists. Still framed in dstFrame chunks
+		// by flush(), with a short remainder, so downstream sees the same samples
+		// in the same order, just sooner and in ragged sizes.
+		minSize = 1
+	}
+	return w.flush(minSize)
 }
 
 type soxrResampler struct {
