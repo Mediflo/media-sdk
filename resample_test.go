@@ -81,21 +81,49 @@ func TestResample(t *testing.T) {
 	writePCM16sWebm(t, srcFileWebm, srcRate, srcFrames)
 	require.True(t, gotSrc == "c774af95" || gotSrc == "b04a6a1f")
 
+	// How the constants below come about: the writer holds output back until it has a
+	// whole destination frame (resampleWriter.flush(minSize)), and every Resample call
+	// is handed exactly one destination frame of output space (dstN in
+	// soxrResampler.Resample). So the resampler's startup delay can never be made up
+	// mid-stream. It surfaces three times over: as a late first frame (Skip), as a
+	// single missed beat where the startup lag settles into the steady-state lag
+	// (Bumps), and finally as the burst of frames Close drains out at the end
+	// (Buffer).
+	//
+	// Since 042f394 ("resample: use SOXR_HQ instead of SOXR_LQ") that delay is much
+	// larger, because HQ's longer filter needs materially more input before a full
+	// destination frame exists. Every constant therefore grew, most at 8k where a
+	// destination frame is only 160 samples and the same delay costs proportionally
+	// more frames. The properties asserted are unchanged — only the numbers that
+	// describe the delay moved. For the record, the SOXR_LQ values were
+	// {16000, Skip: 1, Buffer: 1} and {8000, Skip: 2, Buffer: 3, Bumps: [211]}.
 	for _, c := range []struct {
-		Rate   int
-		Skip   int
+		Rate int
+		// Skip is the source-frame tick at which the FIRST destination frame reaches
+		// the writer: the resampler's startup latency, measured in frames.
+		Skip int
+		// Buffer is the number of trailing frames that Close releases by draining the
+		// resampler. They all land on the last tick, so the steady-state pacing loop
+		// stops short of them and they are checked separately below.
 		Buffer int
-		Bumps  []int
+		// Bumps lists ticks at which the writer legitimately receives nothing, shifting
+		// every later frame one tick further. Under HQ there is exactly one per rate:
+		// the point where the startup lag settles into the steady-state lag.
+		Bumps []int
 	}{
 		{
+			// 48k->16k, 320-sample frames: first frame at tick 1, no frame at tick 2,
+			// steady lag of 2 ticks from there on; Close releases 3 frames.
 			Rate: 16000, Skip: 1,
-			Buffer: 1,
+			Buffer: 3,
+			Bumps:  []int{2},
 		},
 		{
-			Rate: 8000, Skip: 2,
-			Buffer: 3,
-			// TODO: figure out why resampler delays that specific frame; silence?
-			Bumps: []int{211},
+			// 48k->8k, 160-sample frames: first frame at tick 7, no frame at tick 14,
+			// steady lag of 8 ticks from there on; Close releases 9 frames.
+			Rate: 8000, Skip: 7,
+			Buffer: 9,
+			Bumps:  []int{14},
 		},
 	} {
 		t.Run(strconv.Itoa(c.Rate), func(t *testing.T) {
@@ -147,6 +175,31 @@ func TestResample(t *testing.T) {
 					t.Errorf("skipped frame: exp %d, got %d\n%v", exp, num, pw.frameT)
 				}
 			}
+
+			// The pacing loop above stops Buffer frames short of the end. Pin down what
+			// those frames are instead of merely ignoring them: they must be exactly the
+			// tail that Close drains, i.e. all of them land on the very last tick, and
+			// nothing before them does. Otherwise a Buffer grown to accommodate the
+			// resampler's latency would silently hide mid-stream bunching.
+			lastTick := len(srcFrames) - 1
+			for i := len(pw.frameT) - c.Buffer; i < len(pw.frameT); i++ {
+				require.Equal(t, lastTick, pw.frameT[i], "frame %d must be part of the Close drain", i)
+			}
+			require.Less(t, pw.frameT[len(pw.frameT)-c.Buffer-1], lastTick,
+				"only the last %d frames may land on the final tick", c.Buffer)
+
+			// Frame continuity: with early flush off (see WithEarlyFlush) the writer owes
+			// downstream whole destination frames, with at most a short remainder at the
+			// very end. This is what the Buffer/Skip latency is being paid for.
+			dstFrame := len(srcFrames[0]) / (srcRate / c.Rate)
+			for i, sz := range pw.frameSz {
+				if i == len(pw.frameSz)-1 {
+					require.Positive(t, sz)
+					require.LessOrEqual(t, sz, dstFrame, "trailing remainder must not exceed a frame")
+					break
+				}
+				require.Equal(t, dstFrame, sz, "frame %d is not a whole destination frame", i)
+			}
 		})
 	}
 
@@ -195,8 +248,12 @@ func memstats(pid int) int64 {
 }
 
 func TestResampleLeak(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("windows is not supported for this test")
+	// memstats reads /proc/<pid>/statm, which is Linux-only — on macOS (and anywhere
+	// else without procfs) it panics rather than measuring anything. Skip instead of
+	// failing so `go test ./...` is usable on dev machines; CI runs Linux, where the
+	// check is real.
+	if runtime.GOOS != "linux" {
+		t.Skipf("resampler leak check needs /proc/<pid>/statm, unavailable on %s", runtime.GOOS)
 	}
 	pid := os.Getpid()
 
