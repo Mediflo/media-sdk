@@ -643,6 +643,28 @@ a=rtcp-fb:* ccm tmmbr
 	})
 }
 
+// A crypto key shorter than the suite's key length is remote input and must be
+// rejected with an error, not panic on keys[:keyLen].
+func TestParseOfferSRTPShortKey(t *testing.T) {
+	g := media.GlobalCodecs()
+
+	const sdpData = `v=0
+o=- 1 1 IN IP4 127.0.0.1
+s=-
+c=IN IP4 127.0.0.1
+t=0 0
+m=audio 5000 RTP/SAVP 0 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AAAA
+`
+
+	require.NotPanics(t, func() {
+		_, err := ParseOfferWith(g, []byte(sdpData))
+		require.Error(t, err)
+	})
+}
+
 // TestParseOfferLifetimeAndMKI verifies that lifetime and MKI are correctly parsed from an SDP offer
 func TestParseOfferLifetimeAndMKI(t *testing.T) {
 	g := media.GlobalCodecs()
