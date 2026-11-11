@@ -49,7 +49,7 @@ func TestResampleCloseDrainExhaustion(t *testing.T) {
 	const srcRate, dstRate = 8000, 48000
 	frames := drainTestFrames(srcRate, 60)
 
-	run := func(t *testing.T, rounds int) (error, int) {
+	run := func(t *testing.T, rounds int) (int, error) {
 		t.Helper()
 		prev := maxCloseDrainRounds
 		maxCloseDrainRounds = rounds
@@ -60,20 +60,24 @@ func TestResampleCloseDrainExhaustion(t *testing.T) {
 		for _, f := range frames {
 			require.NoError(t, w.WriteSample(f))
 		}
-		return w.Close(), len(got)
+		// Close must run before len(got) is read: it flushes the drained tail into
+		// got, so the two are order-dependent. Sequenced explicitly rather than left
+		// to the evaluation order of a multi-value return.
+		err := w.Close()
+		return len(got), err
 	}
 
 	t.Run("bound exhausted reports ErrIncompleteDrain", func(t *testing.T) {
 		// One round cannot drain a ~180ms backlog: Resample(nil) only gets the
 		// buffer's spare capacity per round.
-		err, n := run(t, 1)
+		n, err := run(t, 1)
 		require.ErrorIs(t, err, ErrIncompleteDrain,
 			"a truncated tail must not be reported as a clean close")
 		require.NotZero(t, n, "the writer must still have delivered the live stream")
 	})
 
 	t.Run("default bound drains cleanly", func(t *testing.T) {
-		err, n := run(t, 64)
+		n, err := run(t, 64)
 		require.NoError(t, err)
 		require.Equal(t, len(frames)*(dstRate/50), n,
 			"every sample fed in must come out when the drain completes")

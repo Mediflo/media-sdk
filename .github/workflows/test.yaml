@@ -63,7 +63,10 @@ jobs:
           go mod tidy
 
       # Run tests with nice formatting. Save the original log in /tmp/gotest.log
+      # -race: this repo carries the audio path (jitter buffer, mixer, resampler),
+      # which is written to concurrently — data races there are exactly the kind of
+      # silent regression this gate exists to catch.
       - name: Run tests
         run: |
           set -euo pipefail
-          go test -json -v ./... 2>&1 | gotestfmt
+          go test -race -json -v ./... 2>&1 | gotestfmt
